@@ -1,5 +1,5 @@
 /* ------------------------------------------------------------------
- * Practica_2_supervisor.ino  -  Dispositivo SUPERVISOR (Práctica 2 IoT)
+ * practica2_supervisor.ino  -  Dispositivo SUPERVISOR (Práctica 2 IoT)
  *
  * Asignatura: GII-IC (Internet de las Cosas), Universidad de Las Palmas
  *             de Gran Canaria.
@@ -23,7 +23,7 @@
  *                               los encola y avisa con un semáforo.
  *   cerrojos   : tx_mtx   -> serializa Serial1
  *                queue_mtx  -> protege la cola de frames recibidos
- *   semáforos  : rsp_sem    -> señal de "llegó respuesta a mi comando";
+ *   semáforos  : rsp_sem    -> señal de "llego un frame";
  *                              el hilo principal espera sobre él con
  *                              TIMEOUT (chSemWaitTimeout).
  *
@@ -38,6 +38,7 @@
 #include "protocol.h"
 #include <string.h>
 #include <stdlib.h>
+#include <errno.h>
 
 // ─── Configuración ─────────────────────────────────────────────────────────
 constexpr uint32_t SERIAL_MONITOR_BAUDS = 115200;
@@ -52,7 +53,7 @@ static ProtoMsg rsp_queue[RSP_QUEUE_SIZE];
 static uint8_t  rsp_head = 0, rsp_tail = 0, rsp_count = 0;
 
 MUTEX_DECL(queue_mtx);        // cerrojo de la cola
-SEMAPHORE_DECL(rsp_sem, 0);   // semáforo: "hay respuesta de comando"
+SEMAPHORE_DECL(rsp_sem, 0);   // semaforo: "hay un frame nuevo"
 MUTEX_DECL(tx_mtx);           // cerrojo de Serial1
 
 // ─── Estado del hilo principal (entrada del usuario) ───────────────────────
@@ -111,20 +112,17 @@ static void drain_queue() {
 // ══════════════════════════════════════════════════════════════════════════
 static THD_FUNCTION(rx_thd, arg) {
   (void)arg;
-  uint8_t buf[PROTO_MSG_SIZE];
-  uint8_t n = 0;
+  ProtoReceiver receiver;
 
   while (true) {
     if (Serial1.available() > 0) {
-      buf[n++] = (uint8_t)Serial1.read();
-      if (n == PROTO_MSG_SIZE) {
-        n = 0;
-        ProtoMsg m = ProtoMsg::deserialize(buf);
-        // Solo las respuestas a comandos activan el semáforo; las
-        // medidas periódicas (asíncronas) se encolan para que el hilo
-        // principal las imprima cuando le venga bien.
-        bool es_respuesta = (m.opcode != OP_RESP_MEASURE);
-        queue_push(m, es_respuesta);
+      ProtoMsg m;
+      if (receiver.push((uint8_t)Serial1.read(),
+                        (uint32_t)((uint64_t)chVTGetSystemTimeX() * 1000ULL /
+                                   CH_CFG_ST_FREQUENCY), true, &m)) {
+        // Todas las tramas despiertan al hilo principal; este distingue
+        // la respuesta esperada de las medidas periodicas al vaciar la cola.
+        queue_push(m, true);
       }
     } else {
       chThdSleepMilliseconds(1); // sin datos: ceder la CPU
@@ -157,6 +155,11 @@ static void print_frame(const ProtoMsg& m) {
   if (re_prompt) Serial.println();
 
   switch (m.opcode) {
+    case OP_RESP_PENDING:
+      Serial.print(F("[RX] disparo solicitado - sensor "));
+      Serial.print(m.dir_sensor);
+      Serial.println(F("; se mostrara la medida cuando se complete"));
+      break;
     case OP_RESP_OK:
       Serial.print(F("[RX] OK - sensor "));
       Serial.println(m.dir_sensor);
@@ -173,17 +176,18 @@ static void print_frame(const ProtoMsg& m) {
       Serial.print(F("[RX] medida sensor "));
       Serial.print(m.dir_sensor);
       Serial.print(F(": "));
-      Serial.print(m.data);
+      if (m.unit == UNIT_MS) Serial.print(m.data / 1000.0, 3);
+      else Serial.print(m.data);
       Serial.print(F(" "));
       Serial.print(unit_name(m.unit));
       Serial.println(m.periodic ? F(" (periodica)") : F(" (one-shot)"));
       break;
 
     case OP_RESP_STATUS: {
-      uint8_t addr7    = (uint8_t)(m.data >> 24);
-      uint8_t unit     = (uint8_t)((m.data >> 16) & 0xFF);
-      uint8_t periodic = (uint8_t)((m.data >> 8) & 0xFF);
-      uint8_t delay    = (uint8_t)(m.data & 0xFF);
+      uint8_t addr7    = SRF02_ADDR7[m.dir_sensor];
+      uint8_t unit     = m.unit;
+      bool periodic   = m.periodic;
+      uint32_t delay  = m.data;
 
       Serial.print(F("[RX] STATUS - sensor "));
       Serial.println(m.dir_sensor);
@@ -230,25 +234,47 @@ static void print_frame(const ProtoMsg& m) {
 //  ENVÍO DE UN COMANDO Y ESPERA DE SU RESPUESTA (con timeout)
 // ══════════════════════════════════════════════════════════════════════════
 static void execute_command(const ProtoMsg& cmd) {
+  drain_queue();
+  while (chSemWaitTimeout(&rsp_sem, TIME_IMMEDIATE) == MSG_OK) { }
   send_frame(cmd);
-
-  // Dormimos el hilo principal sobre el semáforo: si en 2 s no llega
-  // nada, damos el comando por perdido en lugar de bloquearnos.
-  msg_t sig = chSemWaitTimeout(&rsp_sem, TIME_MS2I(RESPONSE_TIMEOUT_MS));
-
-  if (sig != MSG_OK) {
-    // Descartar señales tardías para no confundirlas con la respuesta
-    // del siguiente comando.
-    while (chSemWaitTimeout(&rsp_sem, TIME_IMMEDIATE) == MSG_OK) { }
+  const systime_t start = chVTGetSystemTimeX();
+  bool matched = false;
+  while (!matched && chVTGetSystemTimeX() - start < TIME_MS2I(RESPONSE_TIMEOUT_MS)) {
+    ProtoMsg m;
+    while (queue_pop(&m)) {
+      print_frame(m); // las medidas periodicas siguen mostrandose durante la espera
+      if (m.dir_sensor != cmd.dir_sensor) continue;
+      matched |= (m.opcode == OP_RESP_ERROR && (m.data >> 8) == cmd.opcode) ||
+                 (m.opcode == OP_RESP_OK && m.data == cmd.opcode) ||
+                 (cmd.opcode == OP_US_ONE_SHOT && m.opcode == OP_RESP_PENDING) ||
+                 (cmd.opcode == OP_US_STATUS && m.opcode == OP_RESP_STATUS) ||
+                 (cmd.opcode == OP_US_LIST && m.opcode == OP_RESP_LIST);
+    }
+    if (!matched) chSemWaitTimeout(&rsp_sem, TIME_MS2I(10));
   }
-
-  drain_queue(); // imprime la respuesta (y cualquier medida encolada)
-
-  if (sig != MSG_OK) {
+  if (!matched) {
     Serial.print(F("[RX] TIMEOUT - sin respuesta del sensor en "));
     Serial.print(RESPONSE_TIMEOUT_MS);
     Serial.println(F(" ms"));
+    Serial.println(F("Comprueba alimentacion, TX(14)->RX(13), RX(13)->TX(14) y GND comun."));
   }
+}
+
+static bool parse_number(const char* text, uint32_t* out) {
+  if (!text || !*text) return false;
+  for (const char* p = text; *p; ++p) if (*p < '0' || *p > '9') return false;
+  errno = 0;
+  char* end;
+  unsigned long value = strtoul(text, &end, 10);
+  if (errno == ERANGE || *end || value > UINT32_MAX) return false;
+  *out = (uint32_t)value;
+  return true;
+}
+
+static bool no_extra_args(char** save) {
+  if (!strtok_r(nullptr, " \t", save)) return true;
+  Serial.println(F("[ERROR] sobran argumentos. Escribe 'help'."));
+  return false;
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -267,6 +293,7 @@ static bool parse_command(const char* line, ProtoMsg* out) {
 
   // ── help ──
   if (strcmp(tok, "help") == 0) {
+    if (!no_extra_args(&save)) return false;
     print_help();
     return false;
   }
@@ -286,8 +313,8 @@ static bool parse_command(const char* line, ProtoMsg* out) {
   }
 
   // Índice del sensor (0 => 0xF2, 1 => 0xE0)
-  int sidx = atoi(tok);
-  if (sidx < 0 || sidx >= NUM_SENSORS) {
+  uint32_t sidx;
+  if (!parse_number(tok, &sidx) || sidx >= NUM_SENSORS) {
     Serial.print(F("[ERROR] sensor invalido: "));
     Serial.println(tok);
     return false;
@@ -302,6 +329,7 @@ static bool parse_command(const char* line, ProtoMsg* out) {
 
   // ── us <s> one-shot ──
   if (strcmp(tok, "one-shot") == 0) {
+    if (!no_extra_args(&save)) return false;
     *out = make_command(OP_US_ONE_SHOT, idx);
     return true;
   }
@@ -313,19 +341,11 @@ static bool parse_command(const char* line, ProtoMsg* out) {
       Serial.println(F("[ERROR] falta el periodo: us <s> on <ms>"));
       return false;
     }
-    uint32_t period = (uint32_t)strtoul(p, nullptr, 10);
-    if (period == 0) {
-      Serial.println(F("[ERROR] el periodo debe ser > 0 ms"));
+    if (!no_extra_args(&save)) return false;
+    uint32_t period;
+    if (!parse_number(p, &period)) {
+      Serial.println(F("[ERROR] periodo no representable: usa un entero entre 0 y 4294967295 ms"));
       return false;
-    }
-    // El SRF02 tarda ~70 ms por disparo y la conversión de tiempo del
-    // kernel es de 32 bits: acotamos el periodo a un rango razonable.
-    if (period < 100) {
-      Serial.println(F("[AVISO] periodo minimo 100 ms; se usara 100 ms"));
-      period = 100;
-    } else if (period > 3600000UL) {
-      Serial.println(F("[AVISO] periodo maximo de 1 hora; se usara 3600000 ms"));
-      period = 3600000UL;
     }
     *out = make_command(OP_US_PERIODIC_ON, idx, UNIT_CM, true, period);
     return true;
@@ -333,14 +353,20 @@ static bool parse_command(const char* line, ProtoMsg* out) {
 
   // ── us <s> off ──
   if (strcmp(tok, "off") == 0) {
+    if (!no_extra_args(&save)) return false;
     *out = make_command(OP_US_PERIODIC_OFF, idx);
     return true;
   }
 
-  // ── us <s> unit {cm|inch|ms} ──
+  // ── us <s> unit {inc|cm|ms} ──
   if (strcmp(tok, "unit") == 0) {
     char* p    = strtok_r(nullptr, " \t", &save);
     uint8_t u  = UNIT_CM;
+    if (!p) {
+      Serial.println(F("[ERROR] falta la unidad: cm, inc o ms"));
+      return false;
+    }
+    if (!no_extra_args(&save)) return false;
     if (p) {
       if      (strcmp(p, "cm")   == 0) u = UNIT_CM;
       else if (strcmp(p, "inch") == 0) u = UNIT_INCH;
@@ -363,15 +389,11 @@ static bool parse_command(const char* line, ProtoMsg* out) {
       Serial.println(F("[ERROR] falta el retardo: us <s> delay <ms>"));
       return false;
     }
-    uint32_t d = (uint32_t)strtoul(p, nullptr, 10);
-    // Datasheet SRF02: mínimo 65 ms entre disparos consecutivos; el
-    // campo de retardo del protocolo (8 bits) admite hasta 255 ms.
-    if (d < 65) {
-      Serial.println(F("[AVISO] el SRF02 exige >= 65 ms; se usara 65 ms"));
-      d = 65;
-    } else if (d > 255) {
-      Serial.println(F("[AVISO] retardo maximo 255 ms; se usara 255 ms"));
-      d = 255;
+    if (!no_extra_args(&save)) return false;
+    uint32_t d;
+    if (!parse_number(p, &d)) {
+      Serial.println(F("[ERROR] retardo no representable: usa un entero entre 0 y 4294967295 ms"));
+      return false;
     }
     *out = make_command(OP_US_SET_DELAY, idx, UNIT_CM, false, d);
     return true;
@@ -379,6 +401,7 @@ static bool parse_command(const char* line, ProtoMsg* out) {
 
   // ── us <s> status ──
   if (strcmp(tok, "status") == 0) {
+    if (!no_extra_args(&save)) return false;
     *out = make_command(OP_US_STATUS, idx);
     return true;
   }
@@ -396,10 +419,12 @@ static void print_help() {
   Serial.println(F("  us <s> one-shot           - un unico disparo"));
   Serial.println(F("  us <s> on <period_ms>     - disparo periodico continuo"));
   Serial.println(F("  us <s> off                - detener el disparo periodico"));
-  Serial.println(F("  us <s> unit {cm|inch|ms}  - cambiar unidad de medida"));
+  Serial.println(F("  us <s> unit {inc|cm|ms}   - cambiar unidad de medida"));
   Serial.println(F("  us <s> delay <ms>         - retardo minimo entre disparos"));
   Serial.println(F("  us <s> status             - configuracion del sensor"));
   Serial.println(F("  donde <s> es el indice: 0 => sensor 0xF2, 1 => 0xE0"));
+  Serial.println(F("  one-shot: un disparo; on: mediciones continuas; off: parar las periodicas."));
+  Serial.println(F("  delay configura la espera minima; no inicia mediciones."));
   Serial.println(F("=============================="));
 }
 
@@ -418,7 +443,8 @@ void setup() {
   digitalWrite(LED_BUILTIN, LOW);
 
   Serial.begin(SERIAL_MONITOR_BAUDS);
-  while (!Serial) { /* esperar USB */ }
+  const uint32_t usb_start = millis();
+  while (!Serial && millis() - usb_start < 2000) { }
   Serial1.begin(SERIAL1_BAUDS);
 
   Serial.println(F("=== SUPERVISOR - Practica 2 IoT (ChibiOS/ChRt) ==="));
@@ -442,21 +468,27 @@ void loop() {
   if (Serial.available() > 0) {
     char c = (char)Serial.read();
 
-    if (c == '\r') { /* ignorar CR */ }
-    else if (c == '\n') {
+    static bool previous_cr = false;
+    static bool overflow = false;
+    if (c == '\n' && previous_cr) { previous_cr = false; return; }
+    previous_cr = (c == '\r');
+    if (c == '\r' || c == '\n') {
       Serial.println();
       line_buf[line_len] = '\0';
-      if (line_len > 0) {
+      line_len = 0; // no repintar el comando ya enviado al imprimir respuestas
+      if (overflow) Serial.println(F("[ERROR] linea demasiado larga; comando descartado"));
+      else if (line_buf[0]) {
         ProtoMsg cmd;
         if (parse_command(line_buf, &cmd)) execute_command(cmd);
       }
-      line_len = 0;
+      overflow = false;
       Serial.print(F("> "));
     } else {
       Serial.print(c);
       if (line_len < sizeof(line_buf) - 1) line_buf[line_len++] = c;
+      else overflow = true;
     }
- // } else {
-    //chThdSleepMilliseconds(2); // sin entrada: ceder la CPU
- }
+  } else {
+    chThdSleepMilliseconds(2); // sin entrada: ceder la CPU
+  }
 }

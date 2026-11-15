@@ -1,5 +1,5 @@
 /* ------------------------------------------------------------------
- * Practica_2_sensor.ino  -  Dispositivo SENSOR (Práctica 2 IoT, GII-IC)
+ * practica2_sensor.ino  -  Dispositivo SENSOR (Práctica 2 IoT, GII-IC)
  *
  * Dispositivo terminal sensor con ChibiOS/RT (biblioteca ChRt 1.3):
  *   - Recibe comandos binarios del supervisor por Serial1 (UART 9600)
@@ -50,13 +50,8 @@ constexpr uint8_t  ADDR_CHG_1ST       = 160; // secuencia de cambio de dir. I2C
 constexpr uint8_t  ADDR_CHG_2ND       = 170;
 constexpr uint8_t  ADDR_CHG_3RD       = 165;
 
-constexpr uint32_t SRF02_RANGING_TIME_MS = 70;   // datasheet: >= 65 ms
+constexpr uint32_t SRF02_RANGING_TIME_MS = SRF02_MEASUREMENT_MS;
 constexpr uint32_t SRF02_I2C_INIT_MS     = 100;
-constexpr uint8_t  SRF02_MIN_DELAY_MS    = 65;   // retardo mínimo permitido
-constexpr uint8_t  SRF02_MAX_DELAY_MS    = 255;  // el campo de estado es 8 bits
-constexpr uint32_t SRF02_MIN_PERIOD_MS   = 100;  // < disparo (70) + margen
-constexpr uint32_t SRF02_MAX_PERIOD_MS   = 3600000; // 1 h: TIME_MS2I usa
-                                                    // aritmética de 32 bits
 constexpr uint32_t SRF02_DEFAULT_PERIOD_MS = 500;
 
 // ─── Estado de cada sensor ─────────────────────────────────────────────────
@@ -64,11 +59,14 @@ struct SensorCfg {
   uint8_t  unit;        // unidad activa (UNIT_CM / UNIT_INCH / UNIT_MS)
   bool     periodic;    // disparo periódico activo o no
   uint32_t period_ms;   // periodo del disparo periódico
-  uint8_t  min_delay_ms;// retardo mínimo entre dos disparos consecutivos
+  uint32_t min_delay_ms;// retardo minimo completo, sin truncar a un byte
   bool     present;     // detectado en el bus I2C (cache; se re-sondea)
 };
 
 static SensorCfg sensors[NUM_SENSORS];
+static uint64_t last_shot[NUM_SENSORS];
+static bool has_shot[NUM_SENSORS] = {false, false};
+static bool measuring[NUM_SENSORS] = {false, false}; // bajo i2c_mtx
 
 // ─── Cerrojos (mutex) ──────────────────────────────────────────────────────
 MUTEX_DECL(i2c_mtx);  // bus I2C compartido entre los hilos de rango y rx
@@ -77,16 +75,14 @@ MUTEX_DECL(tx_mtx);   // transmisor Serial1 compartido
 MUTEX_DECL(dbg_mtx);  // monitor de depuración USB
 
 // ─── Mailboxes: orden de trabajo de cada hilo de rango ─────────────────────
-// Cada msg_t lleva: bits 1..0 = orden, bits 31..2 = periodo en ms.
+// La mailbox lleva solo la orden. El periodo uint32_t vive en SensorCfg:
+// empaquetarlo con desplazamientos perderia los bits altos.
 constexpr uint8_t REQ_SHOOT = 0; // disparo único
 constexpr uint8_t REQ_START = 1; // arrancar disparo periódico
 constexpr uint8_t REQ_STOP  = 2; // detener disparo periódico
+constexpr uint8_t REQ_REFRESH = 3; // despertar al cambiar el retardo
 
 constexpr uint8_t REQ_MB_DEPTH = 4;
-
-inline msg_t pack_request(uint8_t cmd, uint32_t period_ms) {
-  return (msg_t)(((period_ms & 0x3FFFFFFFUL) << 2) | (cmd & 0x03));
-}
 
 static msg_t req_buf0[REQ_MB_DEPTH], req_buf1[REQ_MB_DEPTH];
 MAILBOX_DECL(req_mb0, req_buf0, REQ_MB_DEPTH);
@@ -101,6 +97,20 @@ static THD_WORKING_AREA(wa_rx_thd,       512);
 static THD_WORKING_AREA(wa_ranging_thd0, 384); // rango del sensor 0 (0xF2)
 static THD_WORKING_AREA(wa_ranging_thd1, 384); // rango del sensor 1 (0xE0)
 
+// Extiende el contador del kernel a 64 bits. loop() lo actualiza cada
+// segundo incluso si todos los periodos duran dias, para registrar vueltas.
+static uint64_t clock_ms() {
+  static systime_t previous = 0;
+  static uint64_t ticks = 0;
+  chSysLock();
+  const systime_t now = chVTGetSystemTimeX();
+  ticks += (systime_t)(now - previous);
+  previous = now;
+  const uint64_t snapshot = ticks;
+  chSysUnlock();
+  return snapshot * 1000ULL / CH_CFG_ST_FREQUENCY;
+}
+
 // ─── LED de actividad ──────────────────────────────────────────────────────
 static bool led_state = false;
 static inline void toggle_led() {
@@ -110,8 +120,8 @@ static inline void toggle_led() {
 
 // ══════════════════════════════════════════════════════════════════════════
 //  ACCESO I2C AL SRF02
-//  Cada transacción va precedida de chMtxLock(&i2c_mtx): aunque haya dos
-//  hilos de rango disparando a la vez, solo uno toca el bus cada vez.
+//  i2c_mtx protege las transacciones. Durante la conversion del sensor
+//  se libera el bus para poder atender al otro dispositivo.
 // ══════════════════════════════════════════════════════════════════════════
 static bool srf02_write(uint8_t addr7, uint8_t reg, uint8_t value) {
   Wire.beginTransmission(addr7);
@@ -139,16 +149,21 @@ static int srf02_measure(uint8_t idx, uint8_t unit, uint16_t* out) {
 
   chMtxLock(&i2c_mtx);
   bool ok = srf02_write(addr, SRF02_REG_COMMAND, cmd);
+  if (!ok) {
+    chMtxUnlock(&i2c_mtx);
+    return -1;
+  }
+  last_shot[idx] = clock_ms();
+  has_shot[idx] = true;
+  measuring[idx] = true;
   chMtxUnlock(&i2c_mtx);
-  if (!ok) return -1;
 
-  // El sensor mide solo; dormimos sin retener el bus I2C para que el
-  // otro sensor pueda usarlo durante estos 70 ms.
   chThdSleepMilliseconds(SRF02_RANGING_TIME_MS);
 
   chMtxLock(&i2c_mtx);
   int hi = srf02_read(addr, SRF02_REG_RANGE_HI);
   int lo = srf02_read(addr, SRF02_REG_RANGE_LO);
+  measuring[idx] = false;
   chMtxUnlock(&i2c_mtx);
   if (hi < 0 || lo < 0) return -1;
 
@@ -159,7 +174,8 @@ static int srf02_measure(uint8_t idx, uint8_t unit, uint16_t* out) {
 // Sondeo de presencia: ¿responde el sensor en su dirección?
 static bool probe_sensor(uint8_t idx) {
   chMtxLock(&i2c_mtx);
-  int rev = srf02_read(SRF02_ADDR7[idx], SRF02_REG_REVISION);
+  // Durante la medicion el SRF02 no responde a I2C: no es una desconexion.
+  int rev = measuring[idx] ? 0 : srf02_read(SRF02_ADDR7[idx], SRF02_REG_REVISION);
   chMtxUnlock(&i2c_mtx);
   chMtxLock(&cfg_mtx);
   sensors[idx].present = (rev >= 0);
@@ -170,15 +186,15 @@ static bool probe_sensor(uint8_t idx) {
 
 /* ------------------------------------------------------------------
  * Para reprogramar la dirección I2C de un SRF02 (de fábrica todos
- * están en 0xF2 y en la práctica hay que mover uno a 0xE0), basta con
+ * están en 0xE0 y para esta configuracion hay que mover uno a 0xF2), basta con
  * enviar esta secuencia al sensor CON SU DIRECCIÓN ACTUAL y a
  * continuación usar la nueva (ojo: la nueva dirección se escribe ya
  * desplazada, es la dirección de escritura de 8 bits):
  *
- *   write_command(0xF2>>1, ADDR_CHG_1ST); // 0xA0
- *   write_command(0xF2>>1, ADDR_CHG_2ND); // 0xAA
- *   write_command(0xF2>>1, ADDR_CHG_3RD); // 0xA5
- *   write_command(0xF2>>1, 0xE0);         // nueva dirección (8 bits)
+ *   write_command(0xE0>>1, ADDR_CHG_1ST); // 0xA0
+ *   write_command(0xE0>>1, ADDR_CHG_2ND); // 0xAA
+ *   write_command(0xE0>>1, ADDR_CHG_3RD); // 0xA5
+ *   write_command(0xE0>>1, 0xF2);         // nueva dirección (8 bits)
  *   delay(12);                            // > 12 ms antes de usarla
  * ------------------------------------------------------------------ */
 
@@ -204,13 +220,15 @@ static SensorCfg get_cfg(uint8_t idx) {
   return c;
 }
 
-static void reply_ok(uint8_t idx) {
+static void reply_ok(uint8_t idx, uint8_t opcode) {
   SensorCfg c = get_cfg(idx);
-  send_frame(make_command(OP_RESP_OK, idx, c.unit, c.periodic, 0));
+  send_frame(make_command(OP_RESP_OK, idx, c.unit, c.periodic, opcode));
 }
 
-static void reply_error(uint8_t idx, uint8_t code) {
-  send_frame(make_command(OP_RESP_ERROR, idx, UNIT_CM, false, code));
+static void reply_error(uint8_t idx, uint8_t code, uint8_t opcode = 0) {
+  send_frame(make_command(OP_RESP_ERROR, idx, UNIT_CM, false,
+                          ((uint32_t)opcode << 8) | code));
+  if (!Serial) return;
   chMtxLock(&dbg_mtx);
   Serial.print(F("[DBG] error "));
   Serial.print(code);
@@ -219,89 +237,89 @@ static void reply_error(uint8_t idx, uint8_t code) {
   chMtxUnlock(&dbg_mtx);
 }
 
-static bool post_request(uint8_t idx, msg_t req) {
+static bool post_request(uint8_t idx, msg_t req, uint8_t opcode) {
   bool ok = (chMBPostTimeout(req_mb[idx], req, TIME_MS2I(100)) == MSG_OK);
-  if (!ok) reply_error(idx, ERR_QUEUE_FULL);
+  if (!ok) reply_error(idx, ERR_QUEUE_FULL, opcode);
   return ok;
 }
 
 // ══════════════════════════════════════════════════════════════════════════
 //  DISPARO Y ENVÍO DE LA MEDIDA
 // ══════════════════════════════════════════════════════════════════════════
-static void shoot_and_report(uint8_t idx) {
+static void shoot_and_report(uint8_t idx, bool one_shot = false) {
   SensorCfg c = get_cfg(idx);
+  const uint8_t opcode = one_shot ? OP_US_ONE_SHOT : 0;
 
   if (!c.present && !probe_sensor(idx)) {
-    reply_error(idx, ERR_UNKNOWN_SENSOR);
+    reply_error(idx, ERR_UNKNOWN_SENSOR, opcode);
     return;
   }
 
   uint16_t value = 0;
   if (srf02_measure(idx, c.unit, &value) != 0) {
-    reply_error(idx, ERR_I2C_FAIL);
+    reply_error(idx, ERR_I2C_FAIL, opcode);
     return;
   }
 
-  send_frame(make_command(OP_RESP_MEASURE, idx, c.unit, c.periodic, value));
-
-  // Retardo mínimo entre dos disparos consecutivos: además, al ser un
-  // chThdSleep, el CPU se cede al resto de hilos en lugar de bloquearse.
-  chThdSleepMilliseconds(c.min_delay_ms);
+  send_frame(make_command(OP_RESP_MEASURE, idx, c.unit,
+                          !one_shot && c.periodic, value));
 }
 
-// Bucle del disparo periódico. La mailbox hace a la vez de "alarma" de
-// periodo y de canal de órdenes, de modo que un 'off' del supervisor se
-// atiende aunque estemos en medio de un periodo largo.
-static void run_periodic(uint8_t idx, uint32_t period_ms) {
-  mailbox_t* mb = req_mb[idx];
-
-  while (get_cfg(idx).periodic) {
-    msg_t req = 0;
-    msg_t r = chMBFetchTimeout(mb, &req, TIME_MS2I(period_ms));
-
-    if (r == MSG_OK) {
-      uint8_t cmd = (uint8_t)(req & 0x03);
-      if (cmd == REQ_STOP)  return;                 // 'off' del supervisor
-      if (cmd == REQ_START) {                       // periodo nuevo
-        period_ms = (uint32_t)(req >> 2);
-        continue;
-      }
-      continue; // REQ_SHOOT dentro del modo periódico: ya dispara solo
-    }
-
-    // Timeout -> toca disparar
-    if (!get_cfg(idx).periodic) return;             // seguridad
-    shoot_and_report(idx);
-  }
-}
-
-// ══════════════════════════════════════════════════════════════════════════
-//  HILO DE RANGO: UN POR SENSOR
-//  Recibe órdenes del hilo rx a través de su mailbox y ejecuta los
-//  disparos sin bloquear la recepción de comandos.
-// ══════════════════════════════════════════════════════════════════════════
+// Un hilo por sensor programa tanto los disparos unicos como los periodicos.
+// El retardo se ESPERA, en vez de rechazar un one-shot por llegar pronto.
+// La mailbox sigue atendiendo on/off mientras hay una espera pendiente.
 static THD_FUNCTION(ranging_thd, arg) {
-  uint8_t idx = (uint8_t)(uintptr_t)arg;
+  const uint8_t idx = (uint8_t)(uintptr_t)arg;
+  uint32_t pending_shots = 0;
+  bool running = false;
+  uint64_t next_periodic = 0;
 
   while (true) {
+    SensorCfg c = get_cfg(idx);
+    uint64_t now = clock_ms();
+    uint32_t gap = c.min_delay_ms;
+    if (gap < SRF02_MIN_TRIGGER_MS) gap = SRF02_MIN_TRIGGER_MS;
+    uint64_t ready_at = has_shot[idx] ? last_shot[idx] + gap : now;
+    bool periodic_due = running && c.periodic && now >= next_periodic;
+    bool measured = false;
+
+    if ((pending_shots > 0 || periodic_due) && now >= ready_at) {
+      bool one_shot = pending_shots > 0;
+      if (one_shot) --pending_shots;
+      else next_periodic = now + c.period_ms;
+      shoot_and_report(idx, one_shot);
+      measured = true;
+    }
+
+    uint64_t wait_ms = measured ? 0 : 1000; // atiende la mailbox entre disparos
+    if (pending_shots > 0 || periodic_due) {
+      if (ready_at > now && ready_at - now < wait_ms) wait_ms = ready_at - now;
+    } else if (running && c.periodic && next_periodic > now && next_periodic - now < wait_ms) {
+      wait_ms = next_periodic - now;
+    }
+
     msg_t req = 0;
-    if (chMBFetchTimeout(req_mb[idx], &req, TIME_INFINITE) != MSG_OK) continue;
-
-    uint8_t cmd     = (uint8_t)(req & 0x03);
-    uint32_t period = (uint32_t)(req >> 2);
-
-    switch (cmd) {
+    if (chMBFetchTimeout(req_mb[idx], &req, TIME_MS2I((uint32_t)wait_ms)) != MSG_OK) continue;
+    switch ((uint8_t)req) {
       case REQ_SHOOT:
-        shoot_and_report(idx);
+        if (pending_shots == UINT32_MAX) reply_error(idx, ERR_QUEUE_FULL, OP_US_ONE_SHOT);
+        else {
+          ++pending_shots;
+          // Respuesta inmediata de recepcion; la medida confirma despues
+          // la realizacion del disparo, aunque delay dure mas de 2 segundos.
+          send_frame(make_command(OP_RESP_PENDING, idx, get_cfg(idx).unit));
+        }
         break;
       case REQ_START:
-        run_periodic(idx, period);
+        running = true;
+        next_periodic = clock_ms() + get_cfg(idx).period_ms;
+        reply_ok(idx, OP_US_PERIODIC_ON);
         break;
       case REQ_STOP:
-        // Si el hilo está en run_periodic() la orden la consume ahí
-        // (mailbox compartido); si no, no hay nada que detener.
+        running = false;
+        reply_ok(idx, OP_US_PERIODIC_OFF);
         break;
-      default:
+      case REQ_REFRESH:
         break;
     }
   }
@@ -317,31 +335,44 @@ static void handle_frame(const ProtoMsg& m) {
   if (idx == 0xFF || idx != m.dir_sensor) {
     // Respondemos igualmente con el índice del bit 39 para que el
     // supervisor pueda identificar de qué sensor hablamos.
-    reply_error(m.dir_sensor, ERR_UNKNOWN_SENSOR);
+    reply_error(m.dir_sensor, ERR_UNKNOWN_SENSOR, m.opcode);
     return;
   }
 
   switch (m.opcode) {
     case OP_US_ONE_SHOT:
-      if (post_request(idx, pack_request(REQ_SHOOT, 0))) reply_ok(idx);
+      post_request(idx, REQ_SHOOT, m.opcode);
       break;
 
     case OP_US_PERIODIC_ON: {
-      uint32_t period = m.data;
-      if (period < SRF02_MIN_PERIOD_MS) period = SRF02_MIN_PERIOD_MS;
-      if (period > SRF02_MAX_PERIOD_MS) period = SRF02_MAX_PERIOD_MS;
-
-      chMtxLock(&cfg_mtx);
-      if (sensors[idx].periodic) {
-        chMtxUnlock(&cfg_mtx);
-        reply_error(idx, ERR_ALREADY_ACTIVE);
+      if (!probe_sensor(idx)) {
+        reply_error(idx, ERR_UNKNOWN_SENSOR, m.opcode);
         return;
       }
+      uint32_t period = m.data;
+      if (period < SRF02_MEASUREMENT_MS) {
+        reply_error(idx, ERR_PERIOD_TOO_SHORT, m.opcode);
+        return;
+      }
+
+      chMtxLock(&cfg_mtx);
+      if (period < sensors[idx].min_delay_ms) {
+        chMtxUnlock(&cfg_mtx);
+        reply_error(idx, ERR_INVALID_DELAY, m.opcode);
+        return;
+      }
+      const bool was_periodic = sensors[idx].periodic;
+      const uint32_t old_period = sensors[idx].period_ms;
       sensors[idx].periodic  = true;
       sensors[idx].period_ms = period;
       chMtxUnlock(&cfg_mtx);
 
-      if (post_request(idx, pack_request(REQ_START, period))) reply_ok(idx);
+      if (!post_request(idx, REQ_START, m.opcode)) {
+        chMtxLock(&cfg_mtx);
+        sensors[idx].periodic = was_periodic;
+        sensors[idx].period_ms = old_period;
+        chMtxUnlock(&cfg_mtx);
+      }
       break;
     }
 
@@ -351,38 +382,44 @@ static void handle_frame(const ProtoMsg& m) {
       sensors[idx].periodic = false;
       chMtxUnlock(&cfg_mtx);
 
-      if (post_request(idx, pack_request(REQ_STOP, 0))) reply_ok(idx);
+      post_request(idx, REQ_STOP, m.opcode);
       break;
 
     case OP_US_SET_UNIT:
       if (m.unit == UNIT_RSVD) {
-        reply_error(idx, ERR_INVALID_UNIT);
+        reply_error(idx, ERR_INVALID_UNIT, m.opcode);
         return;
       }
       chMtxLock(&cfg_mtx);
       sensors[idx].unit = m.unit;
       chMtxUnlock(&cfg_mtx);
-      reply_ok(idx);
+      reply_ok(idx, m.opcode);
       break;
 
     case OP_US_SET_DELAY: {
       uint32_t d = m.data;
-      if (d < SRF02_MIN_DELAY_MS) d = SRF02_MIN_DELAY_MS;
-      if (d > SRF02_MAX_DELAY_MS) d = SRF02_MAX_DELAY_MS;
       chMtxLock(&cfg_mtx);
-      sensors[idx].min_delay_ms = (uint8_t)d;
+      if (sensors[idx].periodic && d > sensors[idx].period_ms) {
+        chMtxUnlock(&cfg_mtx);
+        reply_error(idx, ERR_INVALID_DELAY, m.opcode);
+        return;
+      }
+      sensors[idx].min_delay_ms = d;
       chMtxUnlock(&cfg_mtx);
-      reply_ok(idx);
+      chMBPostTimeout(req_mb[idx], REQ_REFRESH, TIME_IMMEDIATE);
+      reply_ok(idx, m.opcode);
       break;
     }
 
     case OP_US_STATUS: {
-      probe_sensor(idx);                    // sondeo I2C en vivo
+      if (!probe_sensor(idx)) {
+        reply_error(idx, ERR_UNKNOWN_SENSOR, m.opcode);
+        return;
+      }
       SensorCfg c = get_cfg(idx);
       send_frame(make_command(
         OP_RESP_STATUS, idx, c.unit, c.periodic,
-        pack_status_data(SRF02_ADDR7[idx], c.unit, c.periodic,
-                         c.min_delay_ms)));
+        pack_status_data(c.min_delay_ms)));
       break;
     }
 
@@ -397,7 +434,7 @@ static void handle_frame(const ProtoMsg& m) {
     }
 
     default:
-      reply_error(idx, ERR_UNKNOWN_CMD);
+      reply_error(idx, ERR_UNKNOWN_CMD, m.opcode);
       break;
   }
 }
@@ -407,16 +444,13 @@ static void handle_frame(const ProtoMsg& m) {
 // ══════════════════════════════════════════════════════════════════════════
 static THD_FUNCTION(rx_thd, arg) {
   (void)arg;
-  uint8_t buf[PROTO_MSG_SIZE];
-  uint8_t n = 0;
+  ProtoReceiver receiver;
 
   while (true) {
     if (Serial1.available() > 0) {
-      buf[n++] = (uint8_t)Serial1.read();
-      if (n == PROTO_MSG_SIZE) {
-        n = 0;
-        handle_frame(ProtoMsg::deserialize(buf));
-      }
+      ProtoMsg m;
+      if (receiver.push((uint8_t)Serial1.read(),
+                        (uint32_t)clock_ms(), false, &m)) handle_frame(m);
     } else {
       chThdSleepMilliseconds(1); // sin datos: ceder la CPU
     }
@@ -426,6 +460,36 @@ static THD_FUNCTION(rx_thd, arg) {
 // ══════════════════════════════════════════════════════════════════════════
 //  ARRANQUE (patrón ChRt): setup() -> chBegin(chSetup) -> hilos -> loop()
 // ══════════════════════════════════════════════════════════════════════════
+static void print_detection_report() {
+  bool detected[NUM_SENSORS];
+  uint8_t count = 0;
+  for (uint8_t i = 0; i < NUM_SENSORS; ++i) {
+    detected[i] = probe_sensor(i);
+    if (detected[i]) ++count;
+  }
+
+  chMtxLock(&dbg_mtx);
+  Serial.println(F("=== SENSOR - Practica 2 IoT (ChibiOS/ChRt) ==="));
+  Serial.println(F("Comprobacion de sensores SRF02 por I2C:"));
+  for (uint8_t i = 0; i < NUM_SENSORS; ++i) {
+    Serial.print(F("Sensor "));
+    Serial.print(i);
+    Serial.print(F(" - I2C 0x"));
+    Serial.print(SRF02_ADDR7[i], HEX);
+    Serial.print(F(" (direccion de 8 bits: 0x"));
+    Serial.print(SRF02_ADDR8[i], HEX);
+    Serial.println(detected[i] ? F(") -> DETECTADO") : F(") -> NO DETECTADO"));
+  }
+  Serial.print(F("Sensores detectados: "));
+  Serial.print(count);
+  Serial.print(F(" de "));
+  Serial.println(NUM_SENSORS);
+  Serial.println(count == NUM_SENSORS
+    ? F("[OK] Ambos sensores responden. Terminal listo para recibir comandos.")
+    : F("[AVISO] Faltan sensores: revisa alimentacion, SDA/SCL y direcciones I2C."));
+  chMtxUnlock(&dbg_mtx);
+}
+
 void chSetup() {
   // Prioridad del hilo rx por encima de la de rango: un comando nunca
   // queda esperando a que termine un disparo.
@@ -444,10 +508,11 @@ void setup() {
 
   // Monitor de depuración (solo informativo; el camino crítico es Serial1)
   Serial.begin(SERIAL_MONITOR_BAUDS);
-  while (!Serial) { /* esperar USB */ }
+  // El terminal sensor funciona sin abrir su monitor USB.
   Serial1.begin(SERIAL1_BAUDS);
 
   Wire.begin();
+  Wire.setClock(100000);
   delay(SRF02_I2C_INIT_MS); // arranque del bus I2C (antes del kernel OK)
 
   // Configuración por defecto de los dos sensores
@@ -455,25 +520,16 @@ void setup() {
     sensors[i].unit         = UNIT_CM;
     sensors[i].periodic     = false;
     sensors[i].period_ms    = SRF02_DEFAULT_PERIOD_MS;
-    sensors[i].min_delay_ms = SRF02_MIN_DELAY_MS;
+    sensors[i].min_delay_ms = SRF02_MIN_TRIGGER_MS;
     sensors[i].present      = false;
   }
 
   // OJO: el kernel de ChibiOS todavía NO está arrancado (chBegin está
   // más abajo), así que este sondeo se hace SIN cerrojos: aún no existe
   // ningún otro hilo que pueda entrar en el bus I2C.
-  Serial.println(F("=== SENSOR - Practica 2 IoT (ChibiOS/ChRt) ==="));
   for (uint8_t i = 0; i < NUM_SENSORS; i++) {
     int rev = srf02_read(SRF02_ADDR7[i], SRF02_REG_REVISION);
     sensors[i].present = (rev >= 0);
-    Serial.print(F("SRF02 idx "));
-    Serial.print(i);
-    Serial.print(F(" -> dir I2C 0x"));
-    Serial.print(SRF02_ADDR7[i], HEX);
-    Serial.print(F(" (cruda 0x"));
-    Serial.print(SRF02_ADDR8[i], HEX);
-    Serial.println(sensors[i].present ? F(") : detectado")
-                                      : F(") : NO detectado"));
   }
 
   // Arranca el kernel de ChibiOS y crea los hilos; no vuelve nunca.
@@ -482,9 +538,20 @@ void setup() {
 }
 
 void loop() {
-  // En ChRt, loop() es el HILO PRINCIPAL del sistema. Aquí no hace
-  // trabajo: la recepción y los disparos los llevan sus propios hilos,
-  // así que simplemente dormimos para no consumir CPU.
-  chThdSleepMilliseconds(1000);
+  clock_ms();
+  // El monitor suele abrirse DESPUES de subir el programa. Se presenta
+  // el diagnostico al conectar USB y cada vez que se vuelve a abrir,
+  // sin esperar al monitor para arrancar Serial1 ni los hilos de medida.
+  static bool monitor_was_open = false;
+  // DTR indica el monitor abierto; operator bool tambien acepta RTS,
+  // que algunos terminales dejan activo al cerrar el puerto.
+  bool monitor_open = Serial.dtr();
+  if (monitor_open && !monitor_was_open) {
+    chThdSleepMilliseconds(100); // permite al monitor preparar la recepcion
+    monitor_open = Serial.dtr();
+    if (monitor_open) print_detection_report();
+  }
+  monitor_was_open = monitor_open;
+  chThdSleepMilliseconds(50);
 }
 

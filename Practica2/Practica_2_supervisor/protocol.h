@@ -25,9 +25,8 @@
  *                            valida para comprobar que el mensaje va
  *                            dirigido a un sensor que existe en su bus.
  *   bits 34..33  unidad    : 00 = cm, 01 = inch, 10 = ms
- *                            (el SRF02 devuelve microsegundos en este
- *                            modo, pero se mantiene la etiqueta "ms"
- *                            del guión), 11 = reservado.
+ *                            (el dato binario conserva microsegundos;
+ *                            el supervisor convierte a ms), 11 = reservado.
  *   bit  32      per.      : 1 => disparo periódico activo / orden de
  *                            arranque periódico.
  *   bits 31..0   datos     : significado según el código de operación
@@ -41,15 +40,14 @@
  *   OP_US_SET_DELAY   -> datos = retardo mínimo entre disparos, en ms
  *   OP_US_STATUS      -> datos = 0
  *   OP_US_LIST        -> datos = 0
- *   OP_RESP_OK        -> datos = 0
- *   OP_RESP_ERROR     -> datos = código de error (ver ERR_*)
+ *   OP_RESP_OK        -> datos = opcode del comando confirmado
+ *   OP_RESP_ERROR     -> datos = [15:8] opcode (0: error asincrono),
+ *                                [7:0] codigo de error (ver ERR_*)
  *   OP_RESP_MEASURE   -> datos = medida devuelta por el SRF02
- *   OP_RESP_STATUS    -> datos = [31:24] dir. I2C 7-bit
- *                                [23:16] unidad
- *                                [15:8]  1 si el disparo periódico
- *                                        está activo, 0 si no
- *                                [7:0]   retardo mínimo entre
- *                                        disparos (ms)
+ *   OP_RESP_PENDING   -> disparo unico aceptado; se enviara medida o error
+ *   OP_RESP_STATUS    -> datos = retardo minimo completo (uint32_t, ms).
+ *                        Unidad y periodico estan en los flags; la direccion
+ *                        I2C se obtiene del indice y de SRF02_ADDR7.
  *   OP_RESP_LIST      -> datos = máscara de presencia (bit i = 1 si
  *                        el sensor i está conectado en el bus I2C)
  * ------------------------------------------------------------------ */
@@ -76,23 +74,29 @@ constexpr uint8_t OP_RESP_ERROR   = 0x11; // Incidencia / error
 constexpr uint8_t OP_RESP_MEASURE = 0x12; // Medida (one-shot o periódica)
 constexpr uint8_t OP_RESP_STATUS  = 0x13; // Respuesta de estado
 constexpr uint8_t OP_RESP_LIST    = 0x14; // Respuesta de listado
+constexpr uint8_t OP_RESP_PENDING = 0x15; // Disparo unico pendiente de realizar
 
 // ─── Unidades de medida (bits 34..33) ──────────────────────────────────────
 constexpr uint8_t UNIT_CM     = 0x00;
 constexpr uint8_t UNIT_INCH   = 0x01;
-constexpr uint8_t UNIT_MS     = 0x02; // µs según datasheet, "ms" según guion
+constexpr uint8_t UNIT_MS     = 0x02; // dato en us; el supervisor imprime ms
 constexpr uint8_t UNIT_RSVD   = 0x03; // reservado -> error
 
 // ─── Códigos de error (viajados en OP_RESP_ERROR) ──────────────────────────
 constexpr uint8_t ERR_UNKNOWN_SENSOR = 0x01; // i2cdir no corresponde al sensor
 constexpr uint8_t ERR_I2C_FAIL       = 0x02; // fallo de acceso al SRF02
 constexpr uint8_t ERR_UNKNOWN_CMD    = 0x03; // código de operación desconocido
-constexpr uint8_t ERR_ALREADY_ACTIVE = 0x04; // 'on' con periodo ya activo
 constexpr uint8_t ERR_INVALID_UNIT   = 0x05; // unidad reservada (11)
 constexpr uint8_t ERR_QUEUE_FULL     = 0x06; // cola de órdenes del sensor llena
+constexpr uint8_t ERR_INVALID_DELAY = 0x07; // retardo mayor que el periodo activo
+constexpr uint8_t ERR_PERIOD_TOO_SHORT = 0x08;
+
+// Restricciones de la medicion, no limites arbitrarios de configuracion.
+constexpr uint32_t SRF02_MIN_TRIGGER_MS = 65;
+constexpr uint32_t SRF02_MEASUREMENT_MS = 70; // espera de lectura del firmware
 
 // ─── Sensores SRF02 del sistema ────────────────────────────────────────────
-// De fábrica todos vienen en 0xF2; en la práctica se reprograma uno a 0xE0.
+// De fabrica vienen en 0xE0; para este montaje se reprograma uno a 0xF2.
 // En 7 bits (lo que usa Wire) son 0x79 y 0x70.
 constexpr uint8_t  NUM_SENSORS   = 2;
 constexpr uint8_t  SRF02_ADDR7[NUM_SENSORS] = { 0x79, 0x70 }; // I2C 7-bit
@@ -110,12 +114,8 @@ constexpr uint8_t sensor_idx_from_i2c_dir(uint8_t nibble) {
 }
 
 // ─── Codificación de la respuesta de estado (OP_RESP_STATUS) ───────────────
-inline uint32_t pack_status_data(uint8_t addr7, uint8_t unit,
-                                 bool periodic, uint8_t delay_ms) {
-  return ((uint32_t)addr7 << 24) |
-         ((uint32_t)(unit & 0x03) << 16) |
-         ((uint32_t)(periodic ? 1u : 0u) << 8) |
-         (uint32_t)delay_ms;
+inline uint32_t pack_status_data(uint32_t delay_ms) {
+  return delay_ms;
 }
 
 // ─── Utilidades de impresión (compartidas por ambos dispositivos) ──────────
@@ -133,9 +133,10 @@ inline const char* error_name(uint8_t code) {
     case ERR_UNKNOWN_SENSOR: return "sensor desconocido / dir I2C no valida";
     case ERR_I2C_FAIL:       return "fallo de acceso I2C al SRF02";
     case ERR_UNKNOWN_CMD:    return "codigo de operacion desconocido";
-    case ERR_ALREADY_ACTIVE: return "el disparo periodico ya esta activo";
     case ERR_INVALID_UNIT:   return "unidad de medida no valida";
     case ERR_QUEUE_FULL:     return "cola de ordenes del sensor llena";
+    case ERR_INVALID_DELAY:  return "el periodo debe ser >= al retardo configurado; no se ha cambiado nada";
+    case ERR_PERIOD_TOO_SHORT: return "el firmware necesita al menos 70 ms para completar una medicion";
     default:                 return "error desconocido";
   }
 }
@@ -193,3 +194,31 @@ inline ProtoMsg make_command(uint8_t opcode, uint8_t sensor_idx,
   m.data       = data;
   return m;
 }
+
+// Conserva los seis bytes del formato original. Tras una pausa larga
+// descarta una trama parcial; ante bytes invalidos busca el siguiente
+// candidato. Sin checksum no es posible detectar todas las corrupciones.
+class ProtoReceiver {
+  uint8_t buf[PROTO_MSG_SIZE] = {};
+  uint8_t count = 0;
+  uint32_t last_ms = 0;
+public:
+  bool push(uint8_t b, uint32_t now_ms, bool response, ProtoMsg* out) {
+    if ((uint32_t)(now_ms - last_ms) > 100) count = 0;
+    last_ms = now_ms;
+    buf[count++] = b;
+    if (count < PROTO_MSG_SIZE) return false;
+    ProtoMsg m = ProtoMsg::deserialize(buf);
+    bool valid_op = response
+      ? (m.opcode >= OP_RESP_OK && m.opcode <= OP_RESP_PENDING)
+      : (m.opcode >= OP_US_ONE_SHOT && m.opcode <= OP_US_LIST);
+    if (valid_op && sensor_idx_from_i2c_dir(m.i2c_dir) == m.dir_sensor) {
+      count = 0;
+      *out = m;
+      return true;
+    }
+    for (uint8_t i = 1; i < PROTO_MSG_SIZE; ++i) buf[i - 1] = buf[i];
+    count = PROTO_MSG_SIZE - 1;
+    return false;
+  }
+};
