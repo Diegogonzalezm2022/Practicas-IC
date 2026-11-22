@@ -37,7 +37,9 @@
  *   OP_US_PERIODIC_ON -> datos = periodo deseado en ms
  *   OP_US_PERIODIC_OFF-> datos = 0
  *   OP_US_SET_UNIT    -> datos = 0 (la unidad va en bits 34..33)
- *   OP_US_SET_DELAY   -> datos = retardo mínimo entre disparos, en ms
+ *   OP_US_SET_DELAY   -> datos = espera entre emitir la onda y leer el
+ *                              resultado, en ms (minimo 70; debe ser menor
+ *                              que el periodo configurado)
  *   OP_US_STATUS      -> datos = 0
  *   OP_US_LIST        -> datos = 0
  *   OP_RESP_OK        -> datos = opcode del comando confirmado
@@ -45,7 +47,8 @@
  *                                [7:0] codigo de error (ver ERR_*)
  *   OP_RESP_MEASURE   -> datos = medida devuelta por el SRF02
  *   OP_RESP_PENDING   -> disparo unico aceptado; se enviara medida o error
- *   OP_RESP_STATUS    -> datos = retardo minimo completo (uint32_t, ms).
+ *   OP_RESP_STATUS    -> datos = espera de lectura configurada
+ *                        (uint32_t, ms).
  *                        Unidad y periodico estan en los flags; la direccion
  *                        I2C se obtiene del indice y de SRF02_ADDR7.
  *   OP_RESP_LIST      -> datos = máscara de presencia (bit i = 1 si
@@ -64,7 +67,7 @@ constexpr uint8_t OP_US_ONE_SHOT     = 0x01; // Disparo único
 constexpr uint8_t OP_US_PERIODIC_ON  = 0x02; // Arrancar disparo periódico
 constexpr uint8_t OP_US_PERIODIC_OFF = 0x03; // Detener disparo periódico
 constexpr uint8_t OP_US_SET_UNIT     = 0x04; // Cambiar unidad de medida
-constexpr uint8_t OP_US_SET_DELAY    = 0x05; // Retardo mínimo entre disparos
+constexpr uint8_t OP_US_SET_DELAY    = 0x05; // Espera entre disparo y lectura
 constexpr uint8_t OP_US_STATUS       = 0x06; // Consultar configuración/estado
 constexpr uint8_t OP_US_LIST         = 0x07; // Listar sensores disponibles
 
@@ -88,12 +91,13 @@ constexpr uint8_t ERR_I2C_FAIL       = 0x02; // fallo de acceso al SRF02
 constexpr uint8_t ERR_UNKNOWN_CMD    = 0x03; // código de operación desconocido
 constexpr uint8_t ERR_INVALID_UNIT   = 0x05; // unidad reservada (11)
 constexpr uint8_t ERR_QUEUE_FULL     = 0x06; // cola de órdenes del sensor llena
-constexpr uint8_t ERR_INVALID_DELAY = 0x07; // retardo mayor que el periodo activo
-constexpr uint8_t ERR_PERIOD_TOO_SHORT = 0x08;
+constexpr uint8_t ERR_INVALID_DELAY = 0x07; // delay < 70 ms o mayor/igual que el periodo
+constexpr uint8_t ERR_PERIOD_TOO_SHORT = 0x08; // periodo inferior al minimo de 65 ms
 
-// Restricciones de la medicion, no limites arbitrarios de configuracion.
-constexpr uint32_t SRF02_MIN_TRIGGER_MS = 65;
-constexpr uint32_t SRF02_MEASUREMENT_MS = 70; // espera de lectura del firmware
+// Limites temporales indicados por el fabricante para el SRF02.
+constexpr uint32_t SRF02_MIN_TRIGGER_INTERVAL_MS = 65; // minimo entre disparos
+constexpr uint32_t SRF02_MIN_READ_DELAY_MS = 70;        // el resultado esta listo
+constexpr uint32_t SRF02_DEFAULT_READ_DELAY_MS = 70;    // espera inicial de lectura
 
 // ─── Sensores SRF02 del sistema ────────────────────────────────────────────
 // De fabrica vienen en 0xE0; para este montaje se reprograma uno a 0xF2.
@@ -114,8 +118,8 @@ constexpr uint8_t sensor_idx_from_i2c_dir(uint8_t nibble) {
 }
 
 // ─── Codificación de la respuesta de estado (OP_RESP_STATUS) ───────────────
-inline uint32_t pack_status_data(uint32_t delay_ms) {
-  return delay_ms;
+inline uint32_t pack_status_data(uint32_t ranging_delay_ms) {
+  return ranging_delay_ms;
 }
 
 // ─── Utilidades de impresión (compartidas por ambos dispositivos) ──────────
@@ -135,8 +139,8 @@ inline const char* error_name(uint8_t code) {
     case ERR_UNKNOWN_CMD:    return "codigo de operacion desconocido";
     case ERR_INVALID_UNIT:   return "unidad de medida no valida";
     case ERR_QUEUE_FULL:     return "cola de ordenes del sensor llena";
-    case ERR_INVALID_DELAY:  return "el periodo debe ser >= al retardo configurado; no se ha cambiado nada";
-    case ERR_PERIOD_TOO_SHORT: return "el firmware necesita al menos 70 ms para completar una medicion";
+    case ERR_INVALID_DELAY:  return "configuracion invalida: delay debe ser >= 70 ms y menor que el periodo; no se ha cambiado nada";
+    case ERR_PERIOD_TOO_SHORT: return "el periodo debe ser de al menos 65 ms";
     default:                 return "error desconocido";
   }
 }
@@ -222,3 +226,4 @@ public:
     return false;
   }
 };
+

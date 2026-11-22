@@ -197,7 +197,7 @@ static void print_frame(const ProtoMsg& m) {
       Serial.println(unit_name(unit));
       Serial.print(F("  periodico : "));
       Serial.println(periodic ? F("SI") : F("NO"));
-      Serial.print(F("  retardo   : "));
+      Serial.print(F("  espera onda-lectura: "));
       Serial.print(delay);
       Serial.println(F(" ms"));
       break;
@@ -420,11 +420,10 @@ static void print_help() {
   Serial.println(F("  us <s> on <period_ms>     - disparo periodico continuo"));
   Serial.println(F("  us <s> off                - detener el disparo periodico"));
   Serial.println(F("  us <s> unit {inc|cm|ms}   - cambiar unidad de medida"));
-  Serial.println(F("  us <s> delay <ms>         - retardo minimo entre disparos"));
+  Serial.println(F("  us <s> delay <ms>         - espera entre disparo y lectura (minimo 70 ms)"));
   Serial.println(F("  us <s> status             - configuracion del sensor"));
   Serial.println(F("  donde <s> es el indice: 0 => sensor 0xF2, 1 => 0xE0"));
-  Serial.println(F("  one-shot: un disparo; on: mediciones continuas; off: parar las periodicas."));
-  Serial.println(F("  delay configura la espera minima; no inicia mediciones."));
+  Serial.println(F("  El SRF02 requiere >= 65 ms entre disparos; como on exige superar delay (minimo 70 ms), el periodo valido minimo es 71 ms."));
   Serial.println(F("=============================="));
 }
 
@@ -492,3 +491,6 @@ void loop() {
     chThdSleepMilliseconds(2); // sin entrada: ceder la CPU
   }
 }
+
+
+
